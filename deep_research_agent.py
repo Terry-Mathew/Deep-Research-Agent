@@ -1,115 +1,86 @@
 """
-TMP AI Consulting – Deep Research Agent
-Production-ready with optimized prompts and error handling
-Now with 15 comprehensive searches for deeper insights
+TMP AI Consulting – Stable Research Agent (Serper.dev)
+
 """
 
-from dotenv import load_dotenv
-load_dotenv(override=True)
-
-from agents import Agent, Runner
-from pydantic import BaseModel, Field
-from duckduckgo_search import DDGS
-from duckduckgo_search.exceptions import DuckDuckGoSearchException
-import asyncio
+import os
 import time
-import logging
 import json
+import asyncio
 import hashlib
-import random
-from typing import List, Dict, Any
+import requests
 from dataclasses import dataclass
 from datetime import datetime
+from typing import List
 
-# ------------------------------
-# Configuration
-# ------------------------------
+from dotenv import load_dotenv
+from pydantic import BaseModel
+from agents import Agent, Runner
+
+# --------------------------------------------------
+# ENV
+# --------------------------------------------------
+
+load_dotenv(override=True)
+
+SERPER_API_KEY = os.getenv("SERPER_API_KEY")
+if not SERPER_API_KEY:
+    raise RuntimeError("SERPER_API_KEY not found in environment")
+
+# --------------------------------------------------
+# CONFIG
+# --------------------------------------------------
 
 @dataclass
 class Config:
     MAX_SEARCH_RESULTS: int = 5
-    MAX_CONCURRENT_SEARCHES: int = 2  # Reduced to avoid DDG rate limits
-    MAX_RETRIES: int = 3
-    DEFAULT_MODEL: str = "gpt-4o-mini"
     TEXT_CHUNK_SIZE: int = 4000
-    REPORT_CHUNK_SIZE: int = 20000  # Increased for more content
+    REPORT_CHUNK_SIZE: int = 18000
     CACHE_FILE: str = "research_cache.json"
-    BATCH_DELAY: float = 2.5  # Delay between search batches
+    DEFAULT_MODEL: str = "gpt-4o-mini"
+    SEARCH_DELAY: float = 1.5
 
 config = Config()
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# ------------------------------
-# Cost & Cache Helpers
-# ------------------------------
-
-class CostTracker:
-    def __init__(self):
-        self.calls = 0
-        self.estimated = 0.0
-
-    def add(self, cost=0):
-        self.calls += 1
-        self.estimated += cost
-
-    def summary(self):
-        return {
-            "api_calls": self.calls,
-            "cost_usd": round(self.estimated, 4)
-        }
-    
-    def reset(self):
-        self.calls = 0
-        self.estimated = 0.0
-
-costs = CostTracker()
+# --------------------------------------------------
+# CACHE (FIXED)
+# --------------------------------------------------
 
 class PersistentCache:
-    def __init__(self, cache_file=None):
-        self.cache_file = cache_file or config.CACHE_FILE
+    def __init__(self, file):
+        self.file = file
         self.data = self._load()
 
     def _load(self):
         try:
-            with open(self.cache_file, 'r') as f:
+            with open(self.file, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
+        except Exception:
             return {}
 
     def _save(self):
-        try:
-            with open(self.cache_file, 'w') as f:
-                json.dump(self.data, f, indent=2)
-        except Exception as e:
-            logger.error(f"Failed to save cache: {e}")
+        with open(self.file, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, indent=2, ensure_ascii=False)
 
     def get(self, key):
-        hashed = hashlib.md5(key.encode()).hexdigest()
-        return self.data.get(hashed)
+        return self.data.get(key)
 
     def set(self, key, value):
-        hashed = hashlib.md5(key.encode()).hexdigest()
-        self.data[hashed] = {
+        self.data[key] = {
             "value": value,
             "timestamp": datetime.utcnow().isoformat()
         }
         self._save()
 
-cache = PersistentCache()
+cache = PersistentCache(config.CACHE_FILE)
 
-# ------------------------------
-# Output Structures
-# ------------------------------
+# --------------------------------------------------
+# MODELS
+# --------------------------------------------------
 
 class SearchItem(BaseModel):
-    reason: str
     query: str
+    reason: str
 
 class SearchPlan(BaseModel):
     searches: List[SearchItem]
@@ -121,309 +92,253 @@ class ResearchReport(BaseModel):
     detailed: str
     confidence: str
 
-# ------------------------------
-# Enhanced Agent Prompts (15 Searches)
-# ------------------------------
+# --------------------------------------------------
+# SERPER SEARCH
+# --------------------------------------------------
 
-PLANNER_PROMPT = """You are an expert Research Strategist. Your job is to generate 15 search queries that will help comprehensively answer the user's specific question.
-**CRITICAL INSTRUCTION:**
-Read the user's query carefully. What are they ACTUALLY asking? Generate 15 searches that would help YOU answer their exact question if you were researching it yourself.
-**RULES:**
-1. **Match the query type**: 
-   - Comparison query? → Search for specific differences, not general info
-   - "What is X" query? → Search for definitions, explanations, examples
-   - "How to do X" query? → Search for tutorials, guides, step-by-step
-   - Tool/product query? → Search for specific tools, reviews, comparisons
-   - Creative/fictional query? → Search for folklore, fiction, fan analysis
-   
-2. **Be specific**: Use concrete terms (names, products, places, concepts), not vague keywords
-3. **Stay focused**: All 15 searches should explore different angles of the SAME core question
-4. **Adapt to domain**:
-   - Technical topic? → Use technical terms, version numbers, frameworks
-   - Creative topic? → Use cultural sources, mythology, fiction, fan communities
-   - Regional topic? → Specify regions, compare specific aspects
-   - Abstract topic? → Use academic, theoretical, psychological sources
-5. **No forced structure**: Don't include "history" if they didn't ask for history. Don't include "future trends" if they asked about current tools.
-**YOUR TASK:**
-Generate exactly 15 searches. For each search, write:
-- "reason": A clear explanation of what information this search will uncover (one sentence)
-- "query": A 5-12 word search query optimized for search engines
-**OUTPUT (strict JSON):**
-{
-  "searches": [
-    {"reason": "...", "query": "..."},
-    ...15 total...
-  ]
-}
-**USER QUERY:**"""
+def serper_search(query: str, num: int = 5):
+    url = "https://google.serper.dev/search"
 
-SUMMARIZER_PROMPT = """You are a Senior Research Analyst specializing in information distillation.
-**YOUR ROLE:**
-Extract and synthesize the most valuable insights from raw search results.
-**TASK:**
-Create a precise, fact-dense summary that:
-- Captures 3-5 KEY FACTS or DATA POINTS (prioritize numbers, dates, named entities)
-- Identifies the MAIN ARGUMENT or FINDING
-- Notes any CONTRADICTIONS or LIMITATIONS in the source
-- Maintains ATTRIBUTION (e.g., "According to [source]...")
-**QUALITY CRITERIA:**
-✓ Information density: Every sentence adds value
-✓ Specificity: Include concrete examples, statistics, expert names
-✓ Objectivity: Distinguish facts from opinions
-✓ Relevance: Filter out tangential information
-**CONSTRAINTS:**
-- Length: 150-200 words MAXIMUM
-- No hallucination: If data is unclear, state "unclear" rather than guessing
-- No marketing fluff or generic statements
-- Use active voice and precise language
-**BAD EXAMPLE:**
-"The article discusses various interesting aspects of AI. Many experts believe it's important. There are several challenges and opportunities."
-**GOOD EXAMPLE:**
-"According to Stanford's 2024 AI Index, enterprise AI adoption reached 72% (up from 55% in 2023). Key drivers: cost reduction (43% of implementations) and productivity gains averaging 35%. However, MIT study (n=500 firms) found 68% failed to achieve ROI targets within 18 months, primarily due to data infrastructure gaps and change management issues. Gartner predicts consolidation around 3-4 dominant platforms by 2026."
-**Now summarize this content:**"""
+    headers = {
+        "X-API-KEY": SERPER_API_KEY,
+        "Content-Type": "application/json"
+    }
 
-WRITER_PROMPT = """You are a Distinguished Research Director.
-**YOUR ROLE:**
-Synthesize 15 research summaries into a comprehensive, publication-quality report.
-**CORE INSTRUCTION:**
-Read the provided research summaries first. Then, design a report structure that **naturally fits the content**. 
-Do not force a specific template (like "Technical Foundation" or "Business Impact") if it doesn't match the topic.
-- If the topic is mythology → Structure it around themes, symbolism, and cultural impact.
-- If the topic is software → Structure it around features, architecture, and performance.
-- If the topic is history → Structure it chronologically or by key events.
-**REPORT REQUIREMENTS:**
-**1. TITLE**
-- Clear, descriptive, and engaging (10-15 words)
-**2. EXECUTIVE SUMMARY (180-220 words)**
-- A high-level synthesis of the most important insights
-- Must stand alone as a complete overview
-- Adapt tone to the subject matter
-**3. KEY FINDINGS (exactly 8 bullets)**
-- The 8 most significant facts, themes, or insights discovered
-- Format: "[Core Insight] → [Context/Implication]"
-**4. DETAILED ANALYSIS (1200-1500 words)**
-- **Create your own subsection headers (###)** based on the themes that emerge from the research.
-- Organize the content logically for the reader.
-- Aim for 4-6 distinct sections.
-- Synthesize sources (don't just list them).
-- Use markdown for readability.
-**5. CONFIDENCE ASSESSMENT**
-- Assess the reliability and consensus of the gathered information (High/Medium/Low) with a brief justification.
-**OUTPUT FORMAT (strict JSON):**
-{
-  "title": "string",
-  "summary": "string",
-  "findings": ["string", "string", "string", "string", "string", "string", "string", "string"],
-  "detailed": "markdown string (1200-1500 words with custom ### headers)",
-  "confidence": "string"
-}
-**Now synthesize the research summaries below:**"""
+    payload = {
+        "q": query,
+        "num": num,
+        "hl": "en",
+        "gl": "us"
+    }
 
+    response = requests.post(url, headers=headers, json=payload, timeout=20)
+    response.raise_for_status()
 
-# ------------------------------
-# Agents with Enhanced Prompts
-# ------------------------------
+    data = response.json()
+
+    results = []
+    for item in data.get("organic", []):
+        snippet = item.get("snippet")
+        if snippet:
+            results.append(snippet)
+
+    return results
+
+# --------------------------------------------------
+# AGENTS
+# --------------------------------------------------
 
 planner = Agent(
-    name="ResearchPlanner",
-    instructions=PLANNER_PROMPT,
+    name="Planner",
+    instructions="""
+Developer: # Role and Objective
+Design a comprehensive research plan focused on the user's specified topic, encompassing all major facets and avoiding superficial coverage. Begin with a concise, high-level checklist (3-7 bullets) outlining your major planning steps before generating the detailed search plan, ensuring clarity and completeness in your approach.
+
+# Instructions
+- Do not limit the plan to only high-level searches.
+- Structure the search plan to collectively explore all core dimensions: background, mechanisms, variations, applications, limitations, and modern trends.
+- Emphasize depth and breadth in search design, prioritizing diversity over redundancy.
+- If the topic is broad, ensure the set of searches thoroughly spans the topic space.
+- After generating the full plan, review each dimension to confirm that its span, depth, and variety are adequate; self-correct if superficial or uneven.
+
+# FINAL OUTPUT FORMAT (STRICT — REQUIRED)
+
+Return ONLY the following JSON structure:
+
+{
+  "searches": [
+    {
+      "query": "Exact Google-style search query string",
+      "reason": "Why this search is necessary to fully cover the topic"
+    }
+  ]
+}
+
+Rules:
+- Generate 12–15 searches when the topic is broad
+- Each search must target a distinct dimension of the topic
+- Use concrete, specific search phrasing
+- Do not include any other fields
+- Do not include explanations outside the JSON
+
+""",
     output_type=SearchPlan,
     model=config.DEFAULT_MODEL
 )
 
 summarizer = Agent(
     name="Summarizer",
-    instructions=SUMMARIZER_PROMPT,
+    instructions="""
+# Role and Objective
+Summarize content with depth while maintaining explanatory richness and context. Begin with a concise checklist (3-7 bullets) of what you will do; keep items conceptual, not implementation-level.
+# Instructions
+- Extract and synthesize:
+- Key ideas along with their detailed explanations (not just isolated facts)
+- Underlying causes, mechanisms, or reasoning when available
+- Any conflicting viewpoints or limitations presented
+- Critical context explaining the significance or relevance of the information
+- Important details, even if they seem obvious, should be included
+- Preserve explanations, mechanisms, reasoning, and context throughout the summary
+- Do not aggressively compress the content; avoid reducing information to disconnected bullet points. Preserve narrative and explanatory flow where present.
+- If information is missing or unclear in the source, explicitly note the gap in your summary.
+- After producing the summary, validate that all required elements have been included and that context and explanations are preserved. If critical elements are missing, revisit and revise as necessary.
+# Length Requirement
+- Target summary length: 300–600 words, if the content supports it
+
+""",
     model=config.DEFAULT_MODEL
 )
 
 writer = Agent(
-    name="ReportWriter",
-    instructions=WRITER_PROMPT,
+    name="Writer",
+    instructions="""
+You are an expert generalist researcher.
+
+Your task: produce a COMPLETE and exhaustive report on the provided topic.
+
+Begin with a concise checklist (3-7 bullets) outlining your conceptual sub-tasks for full coverage of the topic before producing the actual report. This will ensure no key dimensions are overlooked.
+
+**Before writing, infer the topic’s domain(s) and identify all major dimensions a well-informed reader would expect to see covered.**
+
+**MANDATORY RULES:**
+1. Do not stop at a surface-level explanation.
+2. Do not optimize for brevity.
+3. Do not assume the reader wants a summary.
+4. Do not skip a dimension because it feels “obvious.”
+5. **TARGET LENGTH: 9,000 - 10,000 WORDS.** You must aim for this length.
+6. **FORMAT:** The output must be valid Markdown.
+7. **CONTENT:** The output must be the *entire* exhaustive report, not a summary or an outline.
+
+**GENERIC COVERAGE CHECK:**
+For any topic, cover each of the following sections as distinct headers (unless the topic’s unique structure requires adaptation):
+- Definition and Scope
+- Origins or Background (if applicable)
+- Core Components or Concepts
+- How It Works / How It is Used
+- Variations or Classifications
+- Practical Examples or Applications
+- Benefits and Strengths
+- Limitations, Risks, or Drawbacks
+- Common Misconceptions or Mistakes
+- Evolution or Modern Developments
+- Broader Impact (social, economic, cultural, scientific—as relevant)
+
+If the topic does not fit perfectly into these sections or spans multiple domains, adapt and augment the section structure for full coverage. You may rename or add sections for clarity or completeness, but do not omit relevant content.
+
+If information is incomplete or uncertain, clearly indicate these gaps and explain any assumptions. Where uncertainty is significant, summarize unanswered questions.
+
+If applicable, provide references, citations, or links supporting factual claims, and include a concluding 'References' section.
+
+**WRITING STANDARD:**
+- Use clear section headers as above (Markdown H2: ## Section Name)
+- Explain mechanisms, not just outcomes
+- Expand each section until it is independently thorough
+- If a knowledgeable reader would say "this is missing X," expand further
+
+**Depth self-check:**
+- Before finishing, ask: "If I were new to this topic and wanted mastery, would I need to ask follow-up questions?"
+- If yes, continue expanding.
+
+After drafting, review the report for completeness and explicitly validate that all relevant dimensions are thoroughly covered. If any are missing or insufficiently explored, expand as needed.
+
+**Output Format:**
+Present the report in Markdown with the following structure:
+- A top-level heading with the report’s title (e.g., # [Topic Name] Report)
+- Optional metadata at the top (e.g., Topic, Date, Domains)
+- One section per coverage area above, each starting with ## Section Name
+- If sources are used, close with a ## References section
+- If information is missing or uncertain, note it in the relevant section and summarize in a final ## Unanswered Questions/Limitations section
+
+**Example:**
+
+# [Topic Name] Report
+
+**Topic:** [Provided Topic]  
+**Date:** [YYYY-MM-DD]  
+**Domains:** [Inferred Domains]
+
+## Definition and Scope
+...
+
+## Origins or Background
+...
+
+... (Other sections)
+
+## References
+1. [Source 1]
+2. [Source 2]
+
+## Unanswered Questions/Limitations
+- [Question or limitation]
+
+""",
     output_type=ResearchReport,
     model=config.DEFAULT_MODEL
 )
 
-# ------------------------------
-# Search Utility (DuckDuckGo)
-# ------------------------------
+# --------------------------------------------------
+# CORE PIPELINE
+# --------------------------------------------------
 
-def ddg_search(query: str, max_results=None):
-    max_results = max_results or config.MAX_SEARCH_RESULTS
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=max_results))
-        logger.info(f"Search successful: {query} ({len(results)} results)")
-        return results
-    except DuckDuckGoSearchException as e:
-        logger.error(f"DuckDuckGo error for '{query}': {e}")
-        return []
-    except Exception as e:
-        logger.error(f"Unexpected search error for '{query}': {e}")
-        return []
+async def run_single_search(user_query: str, item: SearchItem):
+    cache_key = hashlib.md5(f"{user_query}::{item.query}".encode()).hexdigest()
 
-# ------------------------------
-# Pipeline Steps
-# ------------------------------
-
-async def generate_plan(query: str) -> SearchPlan:
-    logger.info(f"Generating research plan for: {query}")
-    result = await Runner.run(planner, f"Research Query: {query}")
-    costs.add(0.002)
-    return result.final_output
-
-async def run_single_search(item: SearchItem, progress_callback=None):
-    """Run a single search with retry logic and caching"""
-    
-    cached = cache.get(item.query)
-    if cached and isinstance(cached, dict):
-        logger.info(f"Cache hit for: {item.query}")
-        if progress_callback:
-            progress_callback(f"✓ Using cached results for: {item.query}")
+    cached = cache.get(cache_key)
+    if cached:
         return cached["value"]
 
-    for attempt in range(config.MAX_RETRIES):
-        try:
-            if progress_callback:
-                progress_callback(f"🔍 Searching: {item.query} (attempt {attempt + 1})")
-            
-            raw_results = ddg_search(item.query)
-            
-            if not raw_results:
-                logger.warning(f"No results for: {item.query}")
-                return f"⚠️ No results found for: {item.query}"
+    snippets = serper_search(item.query, config.MAX_SEARCH_RESULTS)
+    combined_text = "\n".join(snippets)[:config.TEXT_CHUNK_SIZE]
 
-            combined = "\n".join(
-                r.get("body", "") or r.get("snippet", "") or "" 
-                for r in raw_results
-            )
+    summary = await Runner.run(summarizer, combined_text)
 
-            if progress_callback:
-                progress_callback(f"📝 Summarizing results for: {item.query}")
+    cache.set(cache_key, summary.final_output)
+    await asyncio.sleep(config.SEARCH_DELAY)
 
-            summary = await Runner.run(summarizer, combined[:config.TEXT_CHUNK_SIZE])
-            costs.add(0.002)
+    return summary.final_output
 
-            clean = summary.final_output.strip()
-            cache.set(item.query, clean)
-
-            if progress_callback:
-                progress_callback(f"✅ Completed: {item.query}")
-
-            return clean
-
-        except Exception as e:
-            wait_time = (attempt + 1) * 2 + random.uniform(0, 1)  # Add jitter
-            logger.warning(f"Attempt {attempt + 1} failed for '{item.query}': {e}")
-            
-            if attempt < config.MAX_RETRIES - 1:
-                if progress_callback:
-                    progress_callback(f"⏳ Retrying in {wait_time:.1f}s...")
-                await asyncio.sleep(wait_time)
-            else:
-                logger.error(f"All retries exhausted for: {item.query}")
-                return f"❌ Search failed after {config.MAX_RETRIES} attempts: {item.query}"
-
-async def run_all_searches(plan: SearchPlan, progress_callback=None):
-    """Run all searches with concurrency control and batch delays"""
-    semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_SEARCHES)
-    
-    async def bounded_search(item, batch_num):
-        async with semaphore:
-            # Add delay between batches to avoid rate limits
-            if batch_num > 0:
-                delay = config.BATCH_DELAY + random.uniform(0, 0.5)  # Add jitter
-                await asyncio.sleep(delay)
-            return await run_single_search(item, progress_callback)
-    
-    # Group searches into batches
-    batch_size = config.MAX_CONCURRENT_SEARCHES
-    results = []
-    
-    total_batches = (len(plan.searches) + batch_size - 1) // batch_size
-    
-    for i in range(0, len(plan.searches), batch_size):
-        batch = plan.searches[i:i + batch_size]
-        batch_num = i // batch_size
-        
-        if progress_callback:
-            progress_callback(f"🔍 Processing batch {batch_num + 1}/{total_batches} ({len(batch)} searches)")
-        
-        batch_tasks = [bounded_search(s, batch_num) for s in batch]
-        batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
-        results.extend(batch_results)
-        
-        logger.info(f"Completed batch {batch_num + 1}/{total_batches}")
-    
-    # Filter out exceptions
+async def run_all_searches(user_query: str, plan: SearchPlan):
     summaries = []
-    for i, result in enumerate(results):
-        if isinstance(result, Exception):
-            logger.error(f"Search {i} failed: {result}")
-            summaries.append(f"Search failed: {str(result)}")
-        else:
-            summaries.append(result)
-    
+    for item in plan.searches:
+        summaries.append(await run_single_search(user_query, item))
     return summaries
 
-async def generate_report(query: str, summaries: List[str], progress_callback=None):
-    """Generate final report from summaries"""
-    if progress_callback:
-        progress_callback("📊 Synthesizing comprehensive report...")
-    
-    combined = "\n\n".join(summaries)
-    result = await Runner.run(writer, combined[:config.REPORT_CHUNK_SIZE])
-    costs.add(0.005)
-    
+async def generate_report(user_query: str, summaries: List[str]):
+    combined = "\n\n".join(summaries)[:config.REPORT_CHUNK_SIZE]
+
+    writer_input = f"""
+TOPIC:
+{user_query}
+
+SOURCE MATERIAL:
+{combined}
+"""
+
+    result = await Runner.run(writer, writer_input)
     return result.final_output
 
-# ------------------------------
-# MAIN ENTRY
-# ------------------------------
 
-async def run_deep_research(query: str, progress_callback=None):
-    """Main research pipeline with full error handling"""
-    start_time = time.time()
-    costs.reset()  # Reset costs for each research run
-    
-    logger.info(f"Starting research: {query}")
-    
-    try:
-        # Step 1: Generate plan
-        if progress_callback:
-            progress_callback("🎯 Planning 15-point research strategy...")
-        plan = await generate_plan(query)
-        
-        # Step 2: Execute searches
-        if progress_callback:
-            progress_callback(f"🔍 Executing {len(plan.searches)} comprehensive searches...")
-        summaries = await run_all_searches(plan, progress_callback)
-        
-        # Step 3: Generate report
-        report = await generate_report(query, summaries, progress_callback)
-        
-        duration = time.time() - start_time
-        logger.info(f"Research completed in {duration:.2f}s")
-        
-        if progress_callback:
-            progress_callback("✅ Research complete!")
-        
-        return {
-            "report": report.model_dump(),  # Convert Pydantic model to dict
-            "plan": plan.model_dump(),      # Convert Pydantic model to dict
-            "costs": costs.summary(),
-            "duration": round(duration, 2),
-            "status": "success"
-        }
-        
-    except Exception as e:
-        logger.error(f"Research failed: {e}", exc_info=True)
-        return {
-            "report": None,
-            "plan": None,
-            "costs": costs.summary(),
-            "duration": round(time.time() - start_time, 2),
-            "status": "error",
-            "error": str(e)
-        }
+# --------------------------------------------------
+# PUBLIC ENTRYPOINT (USE THIS)
+# --------------------------------------------------
 
+async def run_deep_research(user_query: str):
+    start = time.time()
+
+    plan_result = await Runner.run(planner, user_query)
+    plan = plan_result.final_output
+
+    summaries = await run_all_searches(user_query, plan)
+
+    if len(summaries) < 3:
+        raise RuntimeError("Not enough relevant data found")
+
+    report = await generate_report(user_query, summaries)
+
+    return {
+        "status": "success",
+        "plan": plan.model_dump(),
+        "report": report.model_dump(),
+        "duration": round(time.time() - start, 2)
+    }

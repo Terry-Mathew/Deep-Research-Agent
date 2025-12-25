@@ -1,4 +1,5 @@
-duckduckgo-search==6.3.5
-python-dotenv==1.0.1
-pydantic>=2.10
-openai-agents==0.0.8
+gradio>=4.0
+python-dotenv>=1.0.0
+# OpenAI Agents SDK (already in your project)
+openai-agents
+markdown>=3.0
