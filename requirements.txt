@@ -1,0 +1,4 @@
+duckduckgo-search==6.3.5
+python-dotenv==1.0.1
+pydantic>=2.10
+openai-agents==0.0.8
